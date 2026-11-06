@@ -1,0 +1,484 @@
+--[[ TKiet Test (Fisch) - bản v3: sửa lỗi không hiện menu, thêm nhãn tên ở góc trên trái
+     Main    : Auto Cast / Auto Shake / Auto Reel (máy trạng thái, loại trừ lẫn nhau)
+     Teleport: toàn bộ khu vực (wiki + dữ liệu có sẵn + điểm của game)
+     Player  : Speed (tối đa 200), Infinite Jump, Noclip
+     Nút "—" thu nhỏ menu thành ô vuông chữ K, bấm K để mở lại.
+     LƯU Ý: chưa test trong game. Nhãn debug ở tab Main cho biết phần nào không tìm thấy. ]]
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local GuiService = game:GetService("GuiService")
+local VIM        = game:GetService("VirtualInputManager")
+local UIS        = game:GetService("UserInputService")
+local RS         = game:GetService("ReplicatedStorage")
+local lp         = Players.LocalPlayer
+local pg         = lp:WaitForChild("PlayerGui")
+
+---------------------------------------------------------------- CONFIG
+local CONFIG = {
+    castDelay = 4, castPower = 100,
+    castTimeout = 15,        -- chờ tối đa ở trạng thái cast
+    noBobberFallback = 3,    -- không thấy bobber sau số giây này -> coi như đã chạm nước
+    landTimeout = 6,         -- sau khi chạm nước, chờ nút shake tối đa
+    waitTimeout = 20,        -- sau shake, chờ reel tối đa
+    settleSpeed = 2, settleTime = 0.25,
+    shakeEndGrace = 1.5, reelEndGrace = 0.7,
+    reelRemoteAfter = 3,     -- reel quá số giây này mà chưa xong -> gửi remote reelfinished
+    minSpeed = 16, maxSpeed = 200,
+}
+
+local State = { cast = false, shake = false, reel = false, mouseCast = false,
+                speed = false, infJump = false, noclip = false }
+local speedValue = 50
+local lastCast = 0
+
+---------------------------------------------------------------- HELPERS
+local function char() return lp.Character end
+local function hum()  local c = char(); return c and c:FindFirstChildOfClass("Humanoid") end
+local function hrp()  local c = char(); return c and c:FindFirstChild("HumanoidRootPart") end
+
+local function isRod(t)
+    return t:IsA("Tool") and (t:FindFirstChild("events") ~= nil or t.Name:lower():find("rod") ~= nil)
+end
+
+local function getHeldRod()
+    local c = char()
+    if c then for _, t in ipairs(c:GetChildren()) do if isRod(t) then return t end end end
+end
+
+-- trả về (rod, đã cầm sẵn?)
+local function findRod()
+    local held = getHeldRod()
+    if held then return held, true end
+    local bp, h = lp:FindFirstChild("Backpack"), hum()
+    if bp and h then
+        for _, t in ipairs(bp:GetChildren()) do
+            if isRod(t) then h:EquipTool(t) return t, false end
+        end
+    end
+end
+
+local function findCastRemote(rod)
+    local ev = rod:FindFirstChild("events")
+    local r = ev and ev:FindFirstChild("cast")
+    if r and r:IsA("RemoteEvent") then return r end
+    for _, d in ipairs(rod:GetDescendants()) do
+        if d:IsA("RemoteEvent") and d.Name:lower():find("cast") then return d end
+    end
+end
+
+local function mouseCast()
+    local vp = workspace.CurrentCamera.ViewportSize
+    local x, y = vp.X / 2, vp.Y / 2
+    VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+    task.wait(0.6)
+    VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+end
+
+local function doCast(rod)
+    local r = findCastRemote(rod)
+    if r and not State.mouseCast then
+        r:FireServer(CONFIG.castPower, 1)
+        return "remote"
+    end
+    mouseCast()
+    return "mouse"
+end
+
+-- Tìm GUI theo từ khóa trong tên (không phụ thuộc tên chính xác)
+local function findGui(key)
+    for _, g in ipairs(pg:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled and g.Name:lower():find(key) then return g end
+    end
+end
+
+local function getShakeButton()
+    local ui = findGui("shake")
+    if not ui then return end
+    local sz = ui:FindFirstChild("safezone")
+    local b = sz and sz:FindFirstChild("button")
+    if b and b:IsA("GuiButton") and b.Visible then return b end
+    for _, d in ipairs(ui:GetDescendants()) do
+        if d:IsA("GuiButton") and d.Visible then return d end
+    end
+end
+
+local function getReelBar()
+    local ui = findGui("reel")
+    return ui and ui:FindFirstChild("playerbar", true)
+end
+
+local function clickButton(btn)
+    pcall(function() if firesignal then firesignal(btn.MouseButton1Click) end end)
+    pcall(function()
+        GuiService.SelectedObject = btn
+        VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
+        VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+    end)
+end
+
+local function getBobber()
+    local c = char()
+    if not c then return end
+    for _, t in ipairs(c:GetChildren()) do
+        if t:IsA("Tool") then
+            local b = t:FindFirstChild("bobber", true)
+            if b and b:IsA("BasePart") then return b end
+        end
+    end
+end
+
+local settleSince = nil
+local function bobberOnWater(b, now)
+    local inWater = false
+    pcall(function()
+        local t = workspace.Terrain
+        local cell = t:WorldToCell(b.Position)
+        local center = t:CellCenterToWorld(cell.X, cell.Y, cell.Z)
+        local half = Vector3.new(2, 2, 2)
+        local mats, occ = t:ReadVoxels(Region3.new(center - half, center + half), 4)
+        inWater = mats[1][1][1] == Enum.Material.Water and occ[1][1][1] > 0
+    end)
+    if inWater then return true end
+    if b.AssemblyLinearVelocity.Magnitude < CONFIG.settleSpeed then
+        settleSince = settleSince or now
+        return now - settleSince >= CONFIG.settleTime
+    end
+    settleSince = nil
+    return false
+end
+
+---------------------------------------------------------------- STATE MACHINE (cast/shake/reel loại trừ nhau)
+--   idle -> cast -> splash -> shake -> wait -> reel -> idle
+local Phase, phaseSince = "idle", tick()
+local lastSeen = { shake = 0, reel = 0 }
+local casting, reelStart, reelRemoteFired = false, nil, false
+local phaseLabel, dbgLabel, dbgNote = nil, nil, ""
+
+local function setPhase(p) Phase, phaseSince = p, tick() end
+
+task.spawn(function()
+    local dbgTick = 0
+    while true do
+        task.wait(0.05)
+        local now = tick()
+        local shakeBtn, reelBar = getShakeButton(), getReelBar()
+        if shakeBtn then lastSeen.shake = now end
+        if reelBar  then lastSeen.reel  = now end
+
+        -- 1) chuyển trạng thái
+        if Phase == "reel" then
+            if not reelBar and now - lastSeen.reel > CONFIG.reelEndGrace then setPhase("idle") end
+        elseif Phase == "shake" then
+            if not shakeBtn and now - lastSeen.shake > CONFIG.shakeEndGrace then setPhase("wait") end
+        else
+            if reelBar then setPhase("reel")
+            elseif shakeBtn then setPhase("shake")
+            elseif Phase == "cast" then
+                local b = getBobber()
+                if b and now - phaseSince > 0.5 and bobberOnWater(b, now) then
+                    setPhase("splash")
+                elseif not b and now - phaseSince > CONFIG.noBobberFallback then
+                    setPhase("splash")
+                elseif now - phaseSince > CONFIG.castTimeout then
+                    setPhase("idle")
+                end
+            elseif Phase == "splash" and now - phaseSince > CONFIG.landTimeout then setPhase("idle")
+            elseif Phase == "wait" and now - phaseSince > CONFIG.waitTimeout then setPhase("idle")
+            end
+        end
+
+        -- 2) hành động (mỗi chức năng chỉ chạy đúng trạng thái)
+        if Phase == "idle" and State.cast and not casting and now - lastCast >= CONFIG.castDelay then
+            casting = true
+            task.spawn(function()
+                local ok, err = pcall(function()
+                    local rod, equipped = findRod()
+                    if not rod then dbgNote = "Không thấy cần câu" lastCast = tick() return end
+                    if not equipped then task.wait(0.8) end
+                    local how = doCast(rod)
+                    dbgNote = "Cast bằng " .. how
+                    lastCast = tick(); settleSince = nil
+                    if Phase == "idle" then setPhase("cast") end
+                end)
+                if not ok then dbgNote = "Lỗi cast: " .. tostring(err); lastCast = tick() end
+                casting = false
+            end)
+        elseif Phase == "shake" and State.shake and shakeBtn then
+            clickButton(shakeBtn)
+        end
+
+        if Phase == "reel" then
+            reelStart = reelStart or now
+            if State.reel and not reelRemoteFired and now - reelStart > CONFIG.reelRemoteAfter then
+                reelRemoteFired = true
+                pcall(function() RS.events.reelfinished:FireServer(100, true) end)
+            end
+        else
+            reelStart, reelRemoteFired = nil, false
+        end
+
+        -- 3) nhãn trạng thái / debug
+        if phaseLabel then phaseLabel.Text = "Trạng thái: " .. Phase end
+        if dbgLabel and now - dbgTick > 0.5 then
+            dbgTick = now
+            local rod = getHeldRod()
+            dbgLabel.Text = string.format("Cần: %s | remote cast: %s | shake UI: %s | reel UI: %s\n%s",
+                rod and rod.Name or "chưa cầm", (rod and findCastRemote(rod)) and "có" or "không",
+                findGui("shake") and "có" or "không", findGui("reel") and "có" or "không", dbgNote)
+        end
+    end
+end)
+
+-- Auto Reel: chỉ khi Phase == "reel", đặt thanh control về "1"
+RunService.RenderStepped:Connect(function()
+    if Phase ~= "reel" or not State.reel then return end
+    pcall(function()
+        local bar = getReelBar()
+        if bar then bar.Size = UDim2.new(1, 0, bar.Size.Y.Scale, bar.Size.Y.Offset) end
+    end)
+end)
+
+---------------------------------------------------------------- PLAYER: SPEED / INF JUMP / NOCLIP
+RunService.Heartbeat:Connect(function()
+    if State.speed then
+        local h = hum()
+        if h then h.WalkSpeed = math.clamp(speedValue, CONFIG.minSpeed, CONFIG.maxSpeed) end
+    end
+end)
+
+UIS.JumpRequest:Connect(function()
+    if State.infJump then
+        local h = hum()
+        if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+local noclipOrig = setmetatable({}, { __mode = "k" })
+RunService.Stepped:Connect(function()
+    if not State.noclip then return end
+    local c = char()
+    if not c then return end
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") and p.CanCollide then
+            noclipOrig[p] = true
+            p.CanCollide = false
+        end
+    end
+end)
+local function restoreCollide()
+    for p in pairs(noclipOrig) do if p.Parent then p.CanCollide = true end end
+    table.clear(noclipOrig)
+end
+
+---------------------------------------------------------------- TELEPORT DATA
+local Zones, ZoneSrc = {}, {}
+
+-- Toạ độ GPS: nguồn wiki/guide 2026 ("wiki") và guide cũ ("cũ", có thể đã lệch)
+local BUILTIN = {
+    {"Moosewood", 350, 135, 250, "wiki"},        {"Roslit Bay", -1450, 135, 750, "wiki"},
+    {"Roslit Pond", -1775, 150, 680, "wiki"},    {"Snowcap Island", 2600, 150, 2400, "wiki"},
+    {"Sunstone Island", -935, 130, -1105, "wiki"},{"Terrapin Island", -200, 130, 1925, "wiki"},
+    {"Mushgrove Swamp", 2425, 130, -670, "wiki"}, {"Ancient Isle", 5833, 125, 401, "wiki"},
+    {"Forsaken Shores", -2425, 135, 1555, "wiki"},{"Desolate Deep", -790, 125, -3100, "wiki"},
+    {"The Deep", -194, 130, -4669, "wiki"},       {"Grand Reef", -3555, 150, 510, "guide"},
+    {"Statue of Sovereignty", 35, 135, -1010, "cũ"}, {"The Arch", 1100, 130, -1250, "cũ"},
+    {"Harvesters Spike", -1260, 135, 1550, "cũ"}, {"Birch Cay", 1650, 130, -2350, "cũ"},
+    {"Earmark Island", 1200, 130, 530, "cũ"},     {"Keepers Altar", 1375, -805, -300, "cũ"},
+}
+
+-- Trang wiki sẽ được thử lấy toạ độ lúc chạy (nếu executor cho phép HttpGet)
+local WIKI_PAGES = { "Moosewood", "Roslit Bay", "Snowcap Island", "Sunstone Island", "Terrapin Island",
+    "Mushgrove Swamp", "Ancient Isle", "Forsaken Shores", "Desolate Deep", "Grand Reef", "Castaway Cliffs",
+    "Lost Jungle", "Cursed Isle", "Northern Expedition", "Atlantis", "Mariana's Veil", "Treasure Island",
+    "Statue of Sovereignty", "Vertigo", "The Depths", "Harvesters Spike", "Scoria Reach",
+    "Above The Clouds", "Everturn Forest", "The Arch", "Birch Cay", "Keepers Altar" }
+
+local function addZone(name, v, src) Zones[name] = v; ZoneSrc[name] = src end
+
+for _, z in ipairs(BUILTIN) do addZone(z[1], Vector3.new(z[2], z[3], z[4]), z[5]) end
+
+local function slug(n)
+    local s = n:gsub(" ", "_")
+    s = s:gsub("'", "%%27")
+    return s
+end
+
+local function fetchWiki()
+    local okH, hg = pcall(function() return game.HttpGet end)
+    if not okH or not hg then return 0 end
+    local n = 0
+    for _, name in ipairs(WIKI_PAGES) do
+        local ok, html = pcall(function() return game:HttpGet("https://fischipedia.org/wiki/" .. slug(name)) end)
+        if ok and type(html) == "string" then
+            local x, y, z = html:match("located at%s*(%-?%d+),%s*(%-?%d+),%s*(%-?%d+)")
+            if x then addZone(name, Vector3.new(tonumber(x), tonumber(y), tonumber(z)), "wiki-live"); n = n + 1 end
+        end
+        task.wait(0.1)
+    end
+    return n
+end
+
+local function scanGameSpots()
+    local node = workspace
+    for _, nm in ipairs({ "world", "spawns", "TpSpots" }) do node = node and node:FindFirstChild(nm) end
+    if not node then return 0 end
+    local n = 0
+    for _, p in ipairs(node:GetChildren()) do
+        if p:IsA("BasePart") then addZone(p.Name, p.Position, "game"); n = n + 1
+        elseif p:IsA("Model") then addZone(p.Name, p:GetPivot().Position, "game"); n = n + 1 end
+    end
+    return n
+end
+
+local function zoneNames()
+    local t = {}
+    for n in pairs(Zones) do t[#t + 1] = n end
+    table.sort(t)
+    return t
+end
+
+local function teleportTo(name)
+    local pos, root = Zones[name], hrp()
+    if not (pos and root) then return false end
+    -- tải map quanh điểm đến trước (StreamingEnabled) để khỏi rơi xuyên đất
+    pcall(function() lp:RequestStreamAroundAsync(pos) end)
+    root = hrp()
+    if not root then return false end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = CFrame.new(pos + Vector3.new(0, 6, 0))
+    return true
+end
+
+---------------------------------------------------------------- UI
+local SCRIPT_NAME = "TKiet Test"
+local GUI_NAME = "FischTKietTest"
+
+-- Thử lần lượt: gethui -> CoreGui -> PlayerGui; chọn nơi gắn thành công đầu tiên
+local function candidateParents()
+    local t = {}
+    pcall(function() if gethui then t[#t + 1] = gethui() end end)
+    pcall(function() t[#t + 1] = game:GetService("CoreGui") end)
+    t[#t + 1] = pg
+    return t
+end
+
+for _, p in ipairs(candidateParents()) do
+    pcall(function()
+        for _, n in ipairs({ GUI_NAME, "FischMrDon" }) do
+            local o = p:FindFirstChild(n); if o then o:Destroy() end
+        end
+    end)
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = GUI_NAME
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end end)
+do
+    local attached = false
+    for _, p in ipairs(candidateParents()) do
+        local ok = pcall(function() gui.Parent = p end)
+        if ok and gui.Parent == p then attached = true break end
+    end
+    if not attached then warn("[" .. SCRIPT_NAME .. "] Không gắn được GUI vào bất kỳ nơi nào") end
+end
+
+local function mk(class, props, par)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = par
+    return o
+end
+local BG, FG, ACC, WHITE = Color3.fromRGB(28, 28, 34), Color3.fromRGB(45, 45, 54), Color3.fromRGB(70, 130, 255), Color3.new(1, 1, 1)
+
+local function isPress(i) return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch end
+local function isMove(i) return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch end
+
+-- kéo thả (chuột + cảm ứng); onTap chạy khi chạm mà không kéo
+local function makeDraggable(frame, handle, onTap)
+    local dragging, moved, startIn, startPos = false, false, nil, nil
+    handle.InputBegan:Connect(function(i)
+        if isPress(i) then
+            dragging, moved, startIn, startPos = true, false, i.Position, frame.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if not moved and onTap then onTap() end
+                end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and isMove(i) then
+            local d = i.Position - startIn
+            if d.Magnitude > 6 then moved = true end
+            if moved then
+                frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                           startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end)
+end
+
+-- Cỡ cửa sổ co theo màn hình (điện thoại nằm ngang rất thấp, trước đây menu bị tràn ra ngoài)
+local vpSize = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(800, 600)
+local winW = math.min(300, math.max(220, vpSize.X - 40))
+local winH = math.min(372, math.max(220, vpSize.Y - 80))
+local win = mk("Frame", { Size = UDim2.fromOffset(winW, winH), Position = UDim2.fromOffset(20, 60),
+    BackgroundColor3 = BG, Active = true }, gui)
+mk("UICorner", { CornerRadius = UDim.new(0, 8) }, win)
+local titleBar = mk("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, win)
+mk("TextLabel", { Size = UDim2.new(1, -40, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+    Text = SCRIPT_NAME, TextColor3 = WHITE, Font = Enum.Font.GothamBold, TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left }, titleBar)
+
+-- Nhãn tên script ở góc trên bên trái màn hình (luôn hiện, kể cả khi thu nhỏ).
+-- Dời sang phải một chút để không đè lên nút menu/chat của Roblox. Chạm vào để ẩn/hiện menu.
+local LABEL_POS = UDim2.fromOffset(110, 6)
+local nameTag = mk("TextButton", { Size = UDim2.fromOffset(96, 24), Position = LABEL_POS, BackgroundColor3 = BG,
+    BackgroundTransparency = 0.25, Text = SCRIPT_NAME, TextColor3 = WHITE, Font = Enum.Font.GothamBold,
+    TextSize = 13, AutoButtonColor = false, ZIndex = 10 }, gui)
+mk("UICorner", { CornerRadius = UDim.new(0, 6) }, nameTag)
+mk("UIStroke", { Color = ACC, Thickness = 1 }, nameTag)
+local minBtn = mk("TextButton", { Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, -32, 0, 4), BackgroundColor3 = FG,
+    Text = "—", TextColor3 = WHITE, Font = Enum.Font.GothamBold, TextSize = 14 }, titleBar)
+mk("UICorner", {}, minBtn)
+makeDraggable(win, titleBar)
+
+-- Ô vuông K (thu nhỏ)
+local kBtn = mk("TextButton", { Size = UDim2.fromOffset(44, 44), Position = win.Position, BackgroundColor3 = ACC,
+    Text = "K", TextColor3 = WHITE, Font = Enum.Font.GothamBold, TextSize = 22, Visible = false, AutoButtonColor = false }, gui)
+mk("UICorner", { CornerRadius = UDim.new(0, 6) }, kBtn)
+makeDraggable(kBtn, kBtn, function()
+    win.Position = kBtn.Position
+    kBtn.Visible = false
+    win.Visible = true
+end)
+minBtn.MouseButton1Click:Connect(function()
+    kBtn.Position = win.Position
+    win.Visible = false
+    kBtn.Visible = true
+end)
+-- Chạm nhãn tên: nếu menu/ô K đang hiện thì ẩn hết, nếu đang ẩn thì mở lại menu
+nameTag.MouseButton1Click:Connect(function()
+    if win.Visible or kBtn.Visible then
+        win.Visible, kBtn.Visible = false, false
+    else
+        win.Visible = true
+    end
+end)
+
+-- Tabs
+local tabBar = mk("Frame", { Size = UDim2.new(1, -16, 0, 28), Position = UDim2.fromOffset(8, 32), BackgroundTransparency = 1 }, win)
+mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, tabBar)
+local pages = {}
+local function newTab(name)
+    local btn = mk("TextButton", { Size = UDim2.new(1 / 3, -3, 1, 0), BackgroundColor3 = FG, Text = name,
+        TextColor3 = WHITE, Font = Enum.Font.Gotham, TextSize = 13 }, tabBar)
+    mk("UICorner", {}, btn)
+    local page = mk("Frame", { Size = UDim2.new(1, -16, 1, -68), Position = UDim2.fromOffset(8, 64),
+        BackgroundTranspare
